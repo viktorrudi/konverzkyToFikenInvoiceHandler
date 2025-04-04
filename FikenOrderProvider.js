@@ -1,15 +1,18 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from "@aws-sdk/lib-dynamodb";
 import { SQSClient, SendMessageCommand } from "@aws-sdk/client-sqs";
+import { SNSClient, PublishCommand } from "@aws-sdk/client-sns";
 
 // Initialize clients.
 const ddbClient = new DynamoDBClient({});
 const dynamo = DynamoDBDocumentClient.from(ddbClient);
 const sqsClient = new SQSClient({});
+const snsClient = new SNSClient({});
 
 // Environment variables.
 const TABLE_NAME = process.env.DDB_TABLE;
 const RETRY_QUEUE_URL = process.env.STRIPE_RETRY_QUEUE_URL;
+const SNS_TOPIC_ARN = process.env.MANUAL_ORDER_SNS_TOPIC;
 const bankAccountCode = process.env.FIKEN_BANK_ACCOUNT_CODE;
 const paymentAccount = process.env.FIKEN_PAYMENT_ACCOUNT;
 const companySlug = process.env.FIKEN_COMPANY_SLUG;
@@ -33,6 +36,28 @@ async function sendRetryMessage(messageBody) {
   }
 }
 
+// Helper function to send SNS notification for manual order handling
+async function sendManualOrderNotification(charge) {
+  try {
+    const params = {
+      TopicArn: SNS_TOPIC_ARN,
+      Subject: `Manual order handling required for charge ${charge.id}`,
+      Message: JSON.stringify({
+        message: "A charge requires manual order handling due to missing metadata",
+        charge: charge,
+        timestamp: new Date().toISOString()
+      }, null, 2)
+    };
+    const command = new PublishCommand(params);
+    const response = await snsClient.send(command);
+    console.log("SNS notification sent with ID:", response.MessageId);
+    return response;
+  } catch (error) {
+    console.error("Error sending SNS notification:", error);
+    throw error;
+  }
+}
+
 // The common function that processes a Stripe event.
 async function processStripeEvent(stripeEvent, lambdaInput) {
   // Validate required environment variables.
@@ -43,6 +68,7 @@ async function processStripeEvent(stripeEvent, lambdaInput) {
   if (!stripeApiKey) throw new Error("STRIPE_API_KEY environment variable is not set");
   if (!TABLE_NAME) throw new Error("DDB_TABLE environment variable is not set");
   if (!RETRY_QUEUE_URL) throw new Error("STRIPE_RETRY_QUEUE_URL environment variable is not set");
+  if (!SNS_TOPIC_ARN) throw new Error("MANUAL_ORDER_SNS_TOPIC environment variable is not set");
 
   console.log("[PROCESS] Processing Stripe event:", JSON.stringify({stripeEvent, lambdaInput}, null, 2));
 
@@ -53,16 +79,24 @@ async function processStripeEvent(stripeEvent, lambdaInput) {
   if (!currency) {
     throw new Error(`Missing amount or currency on Charge ${charge.id}.`);
   }
+
+  if (stripeEvent.type !== "charge.succeeded") {
+    console.log(`Ignoring event (cause: ${stripeEvent.type}):`, JSON.stringify(stripeEvent));
+    return { statusCode: 400, body: JSON.stringify({ message: stripeEvent.type }) };
+  }
+
+  if (!charge.metadata || !charge.metadata.order_number) {
+    console.log(`Missing metadata or order_number in charge ${charge.id}, sending SNS notification for manual handling`);
+    await sendManualOrderNotification(charge);
+    return {
+      statusCode: 200,
+      body: JSON.stringify({ message: "Manual order handling notification sent" })
+    };
+  }
+
   const customerId = charge.customer;
   if (!customerId) {
     throw new Error(`No customer ID found on Charge ${charge.id}.`);
-  }
-  // Determine if Stripe event is from Konverzky and not ma&ma.
-  const isFromKonverzky = Boolean(charge.metadata.order_number) && !Boolean(charge.metadata.shop_name);
-  if (!isFromKonverzky || stripeEvent.type !== "charge.succeeded") {
-    const ignoreCause = isFromKonverzky ? "IGNORED STRIPE TYPE" : "NOT FROM KONVERZKY";
-    console.log(`Ignoring event (cause: ${ignoreCause}):`, JSON.stringify(stripeEvent));
-    return { statusCode: 400, body: JSON.stringify({ message: ignoreCause }) };
   }
 
   console.log(`Processing order #${charge.metadata.order_number}`);
