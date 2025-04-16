@@ -82,7 +82,7 @@ async function processStripeEvent(stripeEvent, lambdaInput) {
 
   if (stripeEvent.type !== "charge.succeeded") {
     console.log(`Ignoring event (cause: ${stripeEvent.type}):`, JSON.stringify(stripeEvent));
-    return { statusCode: 400, body: JSON.stringify({ message: stripeEvent.type }) };
+    return { statusCode: 200, body: JSON.stringify({ message: stripeEvent.type }) };
   }
 
   if (!charge.metadata || !charge.metadata.order_number) {
@@ -122,7 +122,7 @@ async function processStripeEvent(stripeEvent, lambdaInput) {
       timestamp: new Date().toISOString()
     };
     await sendRetryMessage(retryPayload);
-    return { statusCode: 404, body: JSON.stringify({ error: "Order not found, event queued for retry" }) };
+    return { statusCode: 200, body: JSON.stringify({ error: "Order not found, event queued for retry" }) };
   }
   console.log("Found order in DB:", JSON.stringify(orderRecord));
 
